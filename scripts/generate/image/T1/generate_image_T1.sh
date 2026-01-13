@@ -1,0 +1,9 @@
+export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+CUDA_VISIBLE_DEVICES=2 
+torchrun --standalone --nproc_per_node=1 ./scripts/generate/image/T1/generate_image_T1.py \
+    --net='./training-runs/00000-edm2-img512-control-xs/network-snapshot-0209715-0.100.pkl' \
+    --gnet='./training-runs/00000-edm2-img512-control-xs/network-snapshot-0005242-0.050.pkl' \
+    --segdir='./synthetic/layout/mask_t1/msk' \
+    --outdir='./synthetic/image/image_t1' \
+    --seeds='0-99' \
+    --batch=16 \

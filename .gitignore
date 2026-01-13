@@ -1,0 +1,56 @@
+# --- Python Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+ENV/
+env/
+
+# --- IDE & OS Files ---
+.vscode/
+.ipynb_checkpoints
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Large Data & Media (Global Exclusion) ---
+# This ensures images and weights are ignored project-wide
+*.jpg
+*.png
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+*.npy
+*.npz
+*.pth
+*.pkl
+*.ckpt
+*.h5
+*.onnx
+*.zip
+*.tar.gz
+*.mp4
+*.pt
+# --- Directory Structure Preservation ---
+# We ignore the contents but allow the directory to exist on GitHub
+datasets/**
+synthetic/**
+training-runs/**
+pretrained_model/**
+pretrained_vae/**
+
+# IMPORTANT: Do not ignore .gitkeep files
+!datasets/.gitkeep
+!synthetic/.gitkeep
+!training-runs/.gitkeep
+!pretrained_model/.gitkeep
+!pretrained_vae/.gitkeep
+!figures/
+!figures/*.png

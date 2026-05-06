@@ -23,6 +23,95 @@ from torch_utils import persistence
 from torch_utils import misc
 
 
+def _collect_resolution_tokens(module_dict):
+    tokens = []
+    for name in module_dict.keys():
+        match = re.match(r'(\d+)x\1_', name)
+        if match is None:
+            continue
+        token = match.group(0)[:-1]
+        if not tokens or tokens[-1] != token:
+            tokens.append(token)
+    return tokens
+
+
+def _build_mask_warmstart_state(pretrained_net, target_net):
+    src_state_dict = pretrained_net.state_dict()
+    dst_state_dict = target_net.state_dict()
+    src_tokens = _collect_resolution_tokens(pretrained_net.unet.enc)
+    dst_tokens = _collect_resolution_tokens(target_net.unet.enc)
+    resolution_map = {src: dst for src, dst in zip(src_tokens, dst_tokens)}
+
+    loadable_state = {}
+    direct_keys = []
+    remapped_keys = []
+    skipped_label_keys = []
+    skipped_missing = []
+    skipped_shape = []
+
+    for src_key, src_tensor in src_state_dict.items():
+        dst_key = src_key
+        for src_token, dst_token in resolution_map.items():
+            dst_key = dst_key.replace(src_token, dst_token)
+
+        if dst_key == 'unet.emb_label.weight':
+            skipped_label_keys.append(src_key)
+            continue
+        if dst_key not in dst_state_dict:
+            skipped_missing.append((src_key, dst_key, tuple(src_tensor.shape)))
+            continue
+        if tuple(src_tensor.shape) != tuple(dst_state_dict[dst_key].shape):
+            skipped_shape.append((src_key, dst_key, tuple(src_tensor.shape), tuple(dst_state_dict[dst_key].shape)))
+            continue
+
+        loadable_state[dst_key] = src_tensor
+        if dst_key == src_key:
+            direct_keys.append(src_key)
+        else:
+            remapped_keys.append((src_key, dst_key))
+
+    return dnnlib.EasyDict(
+        loadable_state=loadable_state,
+        resolution_map=resolution_map,
+        direct_keys=direct_keys,
+        remapped_keys=remapped_keys,
+        skipped_label_keys=skipped_label_keys,
+        skipped_missing=skipped_missing,
+        skipped_shape=skipped_shape,
+    )
+
+
+@torch.no_grad()
+def _load_mask_warmstart(net, ema, pretrained_pkl):
+    dist.print0(f'Warm-starting mask model from {pretrained_pkl} ...')
+    with open(pretrained_pkl, 'rb') as f:
+        pretrained_net = pickle.load(f)['ema'].cpu()
+
+    warmstart = _build_mask_warmstart_state(pretrained_net=pretrained_net, target_net=net)
+    load_result = net.load_state_dict(warmstart.loadable_state, strict=False)
+
+    if getattr(net.unet, 'emb_label', None) is not None:
+        net.unet.emb_label.weight.zero_()
+
+    if ema is not None:
+        ema.reset()
+
+    resolution_map_str = ', '.join(f'{src}->{dst}' for src, dst in warmstart.resolution_map.items())
+    dist.print0(f'Warm start resolution map: {resolution_map_str}')
+    dist.print0(
+        'Warm start summary: '
+        f'loaded={len(warmstart.loadable_state)} '
+        f'(direct={len(warmstart.direct_keys)}, remapped={len(warmstart.remapped_keys)}), '
+        f'skipped_label={len(warmstart.skipped_label_keys)}, '
+        f'skipped_missing={len(warmstart.skipped_missing)}, '
+        f'skipped_shape={len(warmstart.skipped_shape)}'
+    )
+    if load_result.unexpected_keys:
+        dist.print0(f'Warm start unexpected keys: {load_result.unexpected_keys}')
+    if load_result.missing_keys:
+        dist.print0(f'Warm start missing keys: {load_result.missing_keys}')
+
+
 
 #----------------------------------------------------------------------------
 # Uncertainty-based loss function (Equations 14,15,16,21) proposed in the
@@ -85,6 +174,7 @@ def training_loop(
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
+    pretrained_pkl      = './pretrained_model/edm2-img512-xs-2147483-0.135.pkl',
     device              = torch.device('cuda'),
 ):
     # Initialize.
@@ -139,23 +229,9 @@ def training_loop(
 
     # Load previous checkpoint and decide how long to train.
     checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
-    checkpoint.load_latest(run_dir)
-
-    # Load previous checkpoint and decide how long to train.
-    checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
     pretrained_lag = checkpoint.load_latest(run_dir)
     if pretrained_lag is None:
-        with open('./pretrained_model/edm2-img512-xs-2147483-0.135.pkl', 'rb') as f:
-            state_dict = pickle.load(f)['ema'].cpu().state_dict()
-
-        # --- 新增修改：删除不匹配的参数 ---
-        label_key = 'unet.emb_label.weight'
-        if label_key in state_dict:
-            print(f'Skipping mismatched parameter: {label_key}')
-            del state_dict[label_key]
-        # -------------------------------
-        net.load_state_dict(state_dict,strict=False)
-        print('load the pretrained model')
+        _load_mask_warmstart(net=net, ema=ema, pretrained_pkl=pretrained_pkl)
     
     stop_at_nimg = total_nimg
     if slice_nimg is not None:

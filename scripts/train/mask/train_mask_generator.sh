@@ -1,27 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-CUDA_VISIBLE_DEVICES=0 TORCH_DISTRIBUTED_DEBUG=DETAIL \
-python scripts/train/mask/train_mask_generator.py \
-    --outdir=training-runs/00000-edm2-mask512-pixels-xs \
-    --data=./datasets \
-    --preset=edm2-img512-xs \
-    --batch-gpu=4 \
-    --batch=4 \
-    --status='10Ki' \
-    --snapshot='1Mi' \
-    --checkpoint='1Mi' \
-    --lr=0.001 \
-    --duration='50Mi'
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+OUTDIR="${OUTDIR:-training-runs/00000-edm2-mask512-pixels-xs}"
+DATASET="${DATASET:-./datasets}"
+PRETRAINED="${PRETRAINED:-./pretrained_model/edm2-img512-xs-2147483-0.135.pkl}"
+PRESET="${PRESET:-edm2-img512-xs}"
+BATCH_GPU="${BATCH_GPU:-2}"
+BATCH="${BATCH:-4}"
+STATUS="${STATUS:-10Ki}"
+SNAPSHOT="${SNAPSHOT:-1Mi}"
+CHECKPOINT="${CHECKPOINT:-1Mi}"
+LR="${LR:-0.001}"
+DURATION="${DURATION:-50Mi}"
+FP16="${FP16:-True}"
 
-# export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
-# CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 scripts/train/mask/train_mask_generator.py \
-#     --outdir=training-runs/00000-edm2-mask512-pixels-xs \
-#     --data=./datasets \
-#     --preset=edm2-img512-xs \
-#     --batch-gpu=128 \
-#     --batch=256 \
-#     --status='10Ki'\
-#     --snapshot='1Mi'\
-#     --checkpoint='1Mi'\
-#     --lr=0.001 \
-#     --duration='50Mi' 
+if [ "${NPROC_PER_NODE}" -eq 1 ]; then
+    python scripts/train/mask/train_mask_generator.py \
+        --outdir="${OUTDIR}" \
+        --data="${DATASET}" \
+        --pretrained="${PRETRAINED}" \
+        --preset="${PRESET}" \
+        --batch-gpu="${BATCH_GPU}" \
+        --batch="${BATCH}" \
+        --status="${STATUS}" \
+        --snapshot="${SNAPSHOT}" \
+        --checkpoint="${CHECKPOINT}" \
+        --lr="${LR}" \
+        --duration="${DURATION}" \
+        --fp16="${FP16}"
+else
+    torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" scripts/train/mask/train_mask_generator.py \
+        --outdir="${OUTDIR}" \
+        --data="${DATASET}" \
+        --pretrained="${PRETRAINED}" \
+        --preset="${PRESET}" \
+        --batch-gpu="${BATCH_GPU}" \
+        --batch="${BATCH}" \
+        --status="${STATUS}" \
+        --snapshot="${SNAPSHOT}" \
+        --checkpoint="${CHECKPOINT}" \
+        --lr="${LR}" \
+        --duration="${DURATION}" \
+        --fp16="${FP16}"
+fi

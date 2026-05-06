@@ -79,6 +79,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     c.status_nimg = opts.get('status', 0) or None
     c.snapshot_nimg = opts.get('snapshot', 0) or None
     c.checkpoint_nimg = opts.get('checkpoint', 0) or None
+    c.pretrained_pkl = opts.get('pretrained', './pretrained_model/edm2-img512-xs-2147483-0.135.pkl')
     c.seed = opts.get('seed', 0)
     return c
 
@@ -92,6 +93,7 @@ def print_training_config(run_dir, c):
     dist.print0()
     dist.print0(f'Output directory:        {run_dir}')
     dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
+    dist.print0(f'Warm-start checkpoint:   {c.pretrained_pkl}')
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
@@ -137,6 +139,7 @@ def parse_nimg(s):
 # Main options.
 @click.option('--outdir',           help='Where to save the results', metavar='DIR',            type=str, required=True)
 @click.option('--data',             help='Path to the dataset', metavar='ZIP|DIR',              type=str, required=True)
+@click.option('--pretrained',       help='Official EDM2 checkpoint used for warm start', metavar='PKL', type=str, default='./pretrained_model/edm2-img512-xs-2147483-0.135.pkl', show_default=True)
 @click.option('--cond',             help='Train class-conditional model', metavar='BOOL',       type=bool, default=True, show_default=True)
 @click.option('--preset',           help='Configuration preset', metavar='STR',                 type=str, default='edm2-img512-s', show_default=True)
 

@@ -110,7 +110,7 @@ def launch_training(run_dir, c):
         with open(os.path.join(run_dir, 'training_options.json'), 'wt') as f:
             json.dump(c, f, indent=2)
 
-    torch.distributed.barrier()
+    dist.barrier()
     dnnlib.util.Logger(file_name=os.path.join(run_dir, 'log.txt'), file_mode='a', should_flush=True)
     training.training_loop_mask.training_loop(run_dir=run_dir, **c)
 
@@ -185,13 +185,26 @@ def cmdline(outdir, dry_run, **opts):
     """
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
-    dist.print0('Setting up training config...')
-    c = setup_training_config(**opts)
-    print_training_config(run_dir=outdir, c=c)
-    if dry_run:
-        dist.print0('Dry run; exiting.')
-    else:
-        launch_training(run_dir=outdir, c=c)
+    try:
+        dist.print0('Setting up training config...')
+        c = setup_training_config(**opts)
+        if c.batch_size % dist.get_world_size() != 0:
+            raise click.ClickException(f'--batch must be divisible by world size ({dist.get_world_size()})')
+        if c.total_nimg % c.batch_size != 0:
+            raise click.ClickException(f'--duration must be divisible by --batch ({c.batch_size})')
+        if c.status_nimg is not None and c.status_nimg % c.batch_size != 0:
+            raise click.ClickException(f'--status must be divisible by --batch ({c.batch_size})')
+        if c.snapshot_nimg is not None and (c.snapshot_nimg % c.batch_size != 0 or c.snapshot_nimg % 1024 != 0):
+            raise click.ClickException(f'--snapshot must be divisible by both --batch ({c.batch_size}) and 1024')
+        if c.checkpoint_nimg is not None and (c.checkpoint_nimg % c.batch_size != 0 or c.checkpoint_nimg % 1024 != 0):
+            raise click.ClickException(f'--checkpoint must be divisible by both --batch ({c.batch_size}) and 1024')
+        print_training_config(run_dir=outdir, c=c)
+        if dry_run:
+            dist.print0('Dry run; exiting.')
+        else:
+            launch_training(run_dir=outdir, c=c)
+    finally:
+        dist.destroy()
 
 #----------------------------------------------------------------------------
 

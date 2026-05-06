@@ -13,34 +13,46 @@ import torch.distributed
 from . import training_stats
 
 _sync_device = None
+_device = torch.device('cpu')
 
 #----------------------------------------------------------------------------
 
 def init():
     global _sync_device
+    global _device
+
+    # Setup some reasonable defaults for env-based distributed init if
+    # not set by the running environment.
+    if 'MASTER_ADDR' not in os.environ:
+        os.environ['MASTER_ADDR'] = 'localhost'
+    if 'MASTER_PORT' not in os.environ:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        os.environ['MASTER_PORT'] = str(s.getsockname()[1])
+        s.close()
+    if 'RANK' not in os.environ:
+        os.environ['RANK'] = '0'
+    if 'LOCAL_RANK' not in os.environ:
+        os.environ['LOCAL_RANK'] = '0'
+    if 'WORLD_SIZE' not in os.environ:
+        os.environ['WORLD_SIZE'] = '1'
+
+    local_rank = int(os.environ['LOCAL_RANK'])
+    if torch.cuda.is_available():
+        num_visible_devices = torch.cuda.device_count()
+        if local_rank < 0 or local_rank >= num_visible_devices:
+            raise RuntimeError(f'LOCAL_RANK={local_rank} is out of range for {num_visible_devices} visible CUDA device(s)')
+        torch.cuda.set_device(local_rank)
+        _device = torch.device('cuda', local_rank)
+    else:
+        _device = torch.device('cpu')
 
     if not torch.distributed.is_initialized():
-        # Setup some reasonable defaults for env-based distributed init if
-        # not set by the running environment.
-        if 'MASTER_ADDR' not in os.environ:
-            os.environ['MASTER_ADDR'] = 'localhost'
-        if 'MASTER_PORT' not in os.environ:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(('', 0))
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            os.environ['MASTER_PORT'] = str(s.getsockname()[1])
-            s.close()
-        if 'RANK' not in os.environ:
-            os.environ['RANK'] = '0'
-        if 'LOCAL_RANK' not in os.environ:
-            os.environ['LOCAL_RANK'] = '0'
-        if 'WORLD_SIZE' not in os.environ:
-            os.environ['WORLD_SIZE'] = '1'
-        backend = 'gloo' if os.name == 'nt' else 'nccl'
+        backend = 'gloo' if os.name == 'nt' or not torch.cuda.is_available() else 'nccl'
         torch.distributed.init_process_group(backend=backend, init_method='env://')
-        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 
-    _sync_device = torch.device('cuda') if get_world_size() > 1 else None
+    _sync_device = _device if get_world_size() > 1 and _device.type == 'cuda' else None
     training_stats.init_multiprocessing(rank=get_rank(), sync_device=_sync_device)
 
 #----------------------------------------------------------------------------
@@ -52,6 +64,36 @@ def get_rank():
 
 def get_world_size():
     return torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+#----------------------------------------------------------------------------
+
+def get_local_rank():
+    return int(os.environ.get('LOCAL_RANK', '0'))
+
+#----------------------------------------------------------------------------
+
+def get_device():
+    return _device
+
+#----------------------------------------------------------------------------
+
+def barrier():
+    if not torch.distributed.is_initialized():
+        return
+    if torch.distributed.get_backend() == 'nccl':
+        torch.distributed.barrier(device_ids=[get_device().index])
+    else:
+        torch.distributed.barrier()
+
+#----------------------------------------------------------------------------
+
+def destroy():
+    global _sync_device
+    global _device
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+    _sync_device = None
+    _device = torch.device('cpu')
 
 #----------------------------------------------------------------------------
 

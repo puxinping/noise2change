@@ -24,13 +24,14 @@ _reduce_dtype   = torch.float32 # Data type to use for initial per-tensor reduct
 _counter_dtype  = torch.float64 # Data type to use for the internal counters.
 _rank           = 0             # Rank of the current process.
 _sync_device    = None          # Device to use for multiprocess communication. None = single-process.
+_sync_group     = None          # Process group to use for multiprocess communication. None = default group.
 _sync_called    = False         # Has _sync() been called yet?
 _counters       = dict()        # Running counters on each device, updated by report(): name => device => torch.Tensor
 _cumulative     = dict()        # Cumulative counters on the CPU, updated by _sync(): name => torch.Tensor
 
 #----------------------------------------------------------------------------
 
-def init_multiprocessing(rank, sync_device):
+def init_multiprocessing(rank, sync_device, sync_group=None):
     r"""Initializes `torch_utils.training_stats` for collecting statistics
     across multiple processes.
 
@@ -44,10 +45,11 @@ def init_multiprocessing(rank, sync_device):
                         communication, or None to disable multi-process
                         collection. Typically `torch.device('cuda', rank)`.
     """
-    global _rank, _sync_device
+    global _rank, _sync_device, _sync_group
     assert not _sync_called
     _rank = rank
     _sync_device = sync_device
+    _sync_group = sync_group
 
 #----------------------------------------------------------------------------
 
@@ -246,7 +248,7 @@ def _sync(names):
     if _sync_device is not None:
         value = hash(tuple(tuple(ord(char) for char in name) for name in names))
         other = torch.as_tensor(value, dtype=torch.int64, device=_sync_device)
-        torch.distributed.broadcast(tensor=other, src=0)
+        torch.distributed.broadcast(tensor=other, src=0, group=_sync_group)
         if value != int(other.cpu()):
             raise ValueError('Training statistics are inconsistent between ranks')
 
@@ -263,7 +265,7 @@ def _sync(names):
 
     # Sum deltas across ranks.
     if _sync_device is not None:
-        torch.distributed.all_reduce(deltas)
+        torch.distributed.all_reduce(deltas, group=_sync_group)
 
     # Update cumulative values.
     deltas = deltas.cpu()

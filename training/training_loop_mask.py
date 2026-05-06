@@ -23,6 +23,42 @@ from torch_utils import persistence
 from torch_utils import misc
 
 
+def _should_use_cpu_gloo_grad_sync(device):
+    return dist.get_world_size() > 1 and device.type == 'cuda'
+
+
+@torch.no_grad()
+def _sync_module_grads_via_cpu(module, sync_group):
+    params = [param for param in module.parameters() if param.grad is not None]
+    if len(params) == 0:
+        return
+
+    flat_grad = torch.cat([param.grad.detach().to(device='cpu', dtype=torch.float32).reshape(-1) for param in params])
+    torch.distributed.all_reduce(flat_grad, op=torch.distributed.ReduceOp.SUM, group=sync_group)
+    flat_grad.div_(dist.get_world_size())
+
+    offset = 0
+    for param in params:
+        numel = param.grad.numel()
+        param.grad.copy_(flat_grad[offset : offset + numel].view_as(param.grad).to(device=param.grad.device, dtype=param.grad.dtype))
+        offset += numel
+
+
+@torch.no_grad()
+def _check_module_consistency_via_cpu(module, sync_group, ignore_regex=None):
+    for name, tensor in misc.named_params_and_buffers(module):
+        fullname = type(module).__name__ + '.' + name
+        if ignore_regex is not None and re.fullmatch(ignore_regex, fullname):
+            continue
+        local = tensor.detach()
+        if local.is_floating_point():
+            local = torch.nan_to_num(local)
+        local = local.cpu()
+        other = local.clone()
+        torch.distributed.broadcast(tensor=other, src=0, group=sync_group)
+        assert torch.equal(local, other), fullname
+
+
 def _collect_resolution_tokens(module_dict):
     tokens = []
     for name in module_dict.keys():
@@ -175,11 +211,15 @@ def training_loop(
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     pretrained_pkl      = './pretrained_model/edm2-img512-xs-2147483-0.135.pkl',
-    device              = torch.device('cuda'),
+    device              = None,
 ):
     # Initialize.
     prev_status_time = time.time()
-    misc.set_random_seed(seed, dist.get_rank())
+    # Keep model initialization identical across ranks so DDP can safely
+    # skip constructor-time parameter sync.
+    misc.set_random_seed(seed)
+    if device is None:
+        device = dist.get_device()
     torch.backends.cudnn.benchmark = cudnn_benchmark
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -197,13 +237,17 @@ def training_loop(
     assert snapshot_nimg is None or (snapshot_nimg % batch_size == 0 and snapshot_nimg % 1024 == 0)
     assert checkpoint_nimg is None or (checkpoint_nimg % batch_size == 0 and checkpoint_nimg % 1024 == 0)
 
+    use_cpu_gloo_grad_sync = _should_use_cpu_gloo_grad_sync(device)
+    cpu_sync_group = torch.distributed.new_group(backend='gloo') if use_cpu_gloo_grad_sync else None
+    if use_cpu_gloo_grad_sync:
+        training_stats.init_multiprocessing(rank=dist.get_rank(), sync_device=torch.device('cpu'), sync_group=cpu_sync_group)
+
     # Setup dataset, encoder, and network.
     dist.print0('Loading dataset...')
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
     ref_image, ref_label  = dataset_obj[0]
     dist.print0('Setting up encoder...')
     encoder_img = dnnlib.util.construct_class_by_name(**encoder_kwargs)
-    print(torch.as_tensor(ref_image).to(device).unsqueeze(0).shape)
     ref_image = encoder_img.encode_pixels(torch.as_tensor(ref_image).to(device).unsqueeze(0))
 
     dist.print0('Constructing network...')
@@ -213,16 +257,26 @@ def training_loop(
 
     # Print network summary.
     if dist.get_rank() == 0:
+        net.eval()
         misc.print_module_summary(net, [
             torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device),
             torch.ones([batch_gpu], device=device),
             torch.zeros([batch_gpu, net.label_dim], device=device),
         ], max_nesting=2)
+        net.train()
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    dist.barrier()
 
     # Setup training state.
     dist.print0('Setting up training state...')
     state = dnnlib.EasyDict(cur_nimg=0, total_elapsed_time=0)
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
+    ddp_kwargs = {}
+    if device.type == 'cuda':
+        ddp_kwargs.update(device_ids=[device.index], output_device=device.index)
+    if dist.get_world_size() > 1:
+        ddp_kwargs.update(init_sync=False)
+    ddp = torch.nn.parallel.DistributedDataParallel(net, **ddp_kwargs)
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs)
     ema = dnnlib.util.construct_class_by_name(net=net, **ema_kwargs) if ema_kwargs is not None else None
@@ -243,6 +297,7 @@ def training_loop(
     dist.print0()
 
     # Main training loop.
+    misc.set_random_seed(seed, dist.get_rank())
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed, start_idx=state.cur_nimg)
     dataset_iterator = iter(dnnlib.util.construct_class_by_name(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     prev_status_nimg = state.cur_nimg
@@ -308,7 +363,10 @@ def training_loop(
         # Save state checkpoint.
         if checkpoint_nimg is not None and (done or state.cur_nimg % checkpoint_nimg == 0) and state.cur_nimg != start_nimg:
             checkpoint.save(os.path.join(run_dir, f'training-state-{state.cur_nimg//1000:07d}.pt'))
-            misc.check_ddp_consistency(net)
+            if use_cpu_gloo_grad_sync:
+                _check_module_consistency_via_cpu(net, cpu_sync_group)
+            else:
+                misc.check_ddp_consistency(net)
 
         # Done?
         if done:
@@ -319,12 +377,15 @@ def training_loop(
         misc.set_random_seed(seed, dist.get_rank(), state.cur_nimg)
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
-            with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
+            sync_context = ddp.no_sync() if use_cpu_gloo_grad_sync else misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1))
+            with sync_context:
                 masks, labels = next(dataset_iterator)
                 masks = encoder_img.encode_pixels(masks.to(device))
                 loss = loss_fn(net=ddp, images=masks, labels=labels.to(device))
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+        if use_cpu_gloo_grad_sync:
+            _sync_module_grads_via_cpu(net, cpu_sync_group)
 
         # Run optimizer and update weights.
         lr = dnnlib.util.call_func_by_name(cur_nimg=state.cur_nimg, batch_size=batch_size, **lr_kwargs)

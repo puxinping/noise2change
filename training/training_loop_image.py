@@ -8,6 +8,7 @@
 """Main training loop."""
 
 import os
+import re
 import time
 import copy
 import pickle
@@ -19,6 +20,168 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import persistence
 from torch_utils import misc
+
+
+def _should_use_cpu_gloo_grad_sync(device):
+    return dist.get_world_size() > 1 and device.type == 'cuda'
+
+
+@torch.no_grad()
+def _sync_module_grads_via_cpu(module, sync_group):
+    params = [param for param in module.parameters() if param.grad is not None]
+    if len(params) == 0:
+        return
+
+    flat_grad = torch.cat([param.grad.detach().to(device='cpu', dtype=torch.float32).reshape(-1) for param in params])
+    torch.distributed.all_reduce(flat_grad, op=torch.distributed.ReduceOp.SUM, group=sync_group)
+    flat_grad.div_(dist.get_world_size())
+
+    offset = 0
+    for param in params:
+        numel = param.grad.numel()
+        param.grad.copy_(flat_grad[offset : offset + numel].view_as(param.grad).to(device=param.grad.device, dtype=param.grad.dtype))
+        offset += numel
+
+
+@torch.no_grad()
+def _check_module_consistency_via_cpu(module, sync_group, ignore_regex=None):
+    for name, tensor in misc.named_params_and_buffers(module):
+        fullname = type(module).__name__ + '.' + name
+        if ignore_regex is not None and re.fullmatch(ignore_regex, fullname):
+            continue
+        local = tensor.detach()
+        if local.is_floating_point():
+            local = torch.nan_to_num(local)
+        local = local.cpu()
+        other = local.clone()
+        torch.distributed.broadcast(tensor=other, src=0, group=sync_group)
+        assert torch.equal(local, other), fullname
+
+
+def _collect_resolution_tokens(module_dict):
+    tokens = []
+    for name in module_dict.keys():
+        match = re.match(r'(\d+)x\1_', name)
+        if match is None:
+            continue
+        token = match.group(0)[:-1]
+        if not tokens or tokens[-1] != token:
+            tokens.append(token)
+    return tokens
+
+
+def _bridge_input_conv_weight(src_tensor, dst_tensor):
+    bridged = torch.zeros(dst_tensor.shape, dtype=src_tensor.dtype, device=src_tensor.device)
+    bridged[:, :4] = src_tensor[:, :4]
+    bridged[:, -1:] = src_tensor[:, -1:]
+    return bridged
+
+
+def _bridge_output_conv_weight(src_tensor, dst_tensor):
+    bridged = torch.zeros(dst_tensor.shape, dtype=src_tensor.dtype, device=src_tensor.device)
+    bridged[:4] = src_tensor
+    return bridged
+
+
+def _build_image_warmstart_state(pretrained_net, target_net):
+    src_state_dict = pretrained_net.state_dict()
+    dst_state_dict = target_net.state_dict()
+    src_tokens = _collect_resolution_tokens(pretrained_net.unet.enc)
+    dst_tokens = _collect_resolution_tokens(target_net.unet.enc)
+    resolution_map = {src: dst for src, dst in zip(src_tokens, dst_tokens)}
+
+    loadable_state = {}
+    direct_keys = []
+    remapped_keys = []
+    bridged_keys = []
+    expanded_emb_linear_keys = []
+    skipped_label_keys = []
+    skipped_missing = []
+    skipped_shape = []
+
+    for src_key, src_tensor in src_state_dict.items():
+        dst_key = src_key
+        for src_token, dst_token in resolution_map.items():
+            dst_key = dst_key.replace(src_token, dst_token)
+
+        tensor_to_load = src_tensor
+        if src_key == 'unet.emb_label.weight':
+            skipped_label_keys.append(src_key)
+            continue
+        if dst_key == 'unet.enc.128x128_conv.weight':
+            tensor_to_load = _bridge_input_conv_weight(src_tensor=src_tensor, dst_tensor=dst_state_dict[dst_key])
+            bridged_keys.append((src_key, dst_key, 'input-conv'))
+        elif dst_key == 'unet.out_conv.weight':
+            tensor_to_load = _bridge_output_conv_weight(src_tensor=src_tensor, dst_tensor=dst_state_dict[dst_key])
+            bridged_keys.append((src_key, dst_key, 'output-conv'))
+        elif src_key.endswith('emb_linear.weight') and src_tensor.ndim == 2:
+            tensor_to_load = src_tensor[:, :, None, None]
+            expanded_emb_linear_keys.append((src_key, dst_key))
+
+        if dst_key not in dst_state_dict:
+            skipped_missing.append((src_key, dst_key, tuple(src_tensor.shape)))
+            continue
+        if tuple(tensor_to_load.shape) != tuple(dst_state_dict[dst_key].shape):
+            skipped_shape.append((src_key, dst_key, tuple(tensor_to_load.shape), tuple(dst_state_dict[dst_key].shape)))
+            continue
+
+        loadable_state[dst_key] = tensor_to_load
+        if dst_key == src_key and torch.equal(tensor_to_load.detach().cpu(), src_tensor.detach().cpu()):
+            direct_keys.append(src_key)
+        elif any(dst_key == bridged_key for _, bridged_key, _ in bridged_keys):
+            pass
+        else:
+            remapped_keys.append((src_key, dst_key))
+
+    return dnnlib.EasyDict(
+        loadable_state=loadable_state,
+        resolution_map=resolution_map,
+        direct_keys=direct_keys,
+        remapped_keys=remapped_keys,
+        bridged_keys=bridged_keys,
+        expanded_emb_linear_keys=expanded_emb_linear_keys,
+        skipped_label_keys=skipped_label_keys,
+        skipped_missing=skipped_missing,
+        skipped_shape=skipped_shape,
+    )
+
+
+@torch.no_grad()
+def _zero_module_parameters(module):
+    if module is None:
+        return
+    for parameter in module.parameters():
+        parameter.zero_()
+
+
+@torch.no_grad()
+def _load_image_warmstart(net, ema, pretrained_pkl):
+    dist.print0(f'Warm-starting image model from {pretrained_pkl} ...')
+    with open(pretrained_pkl, 'rb') as f:
+        pretrained_net = pickle.load(f)['ema'].cpu()
+
+    warmstart = _build_image_warmstart_state(pretrained_net=pretrained_net, target_net=net)
+    load_result = net.load_state_dict(warmstart.loadable_state, strict=False)
+    _zero_module_parameters(getattr(net.unet, 'emb_label', None))
+
+    if ema is not None:
+        ema.reset()
+
+    resolution_map_str = ', '.join(f'{src}->{dst}' for src, dst in warmstart.resolution_map.items())
+    dist.print0(f'Warm start resolution map: {resolution_map_str}')
+    dist.print0(
+        'Warm start summary: '
+        f'loaded={len(warmstart.loadable_state)} '
+        f'(direct={len(warmstart.direct_keys)}, remapped={len(warmstart.remapped_keys)}, '
+        f'bridged={len(warmstart.bridged_keys)}, emb_linear_expanded={len(warmstart.expanded_emb_linear_keys)}), '
+        f'skipped_label={len(warmstart.skipped_label_keys)}, '
+        f'skipped_missing={len(warmstart.skipped_missing)}, '
+        f'skipped_shape={len(warmstart.skipped_shape)}'
+    )
+    if load_result.unexpected_keys:
+        dist.print0(f'Warm start unexpected keys: {load_result.unexpected_keys}')
+    if load_result.missing_keys:
+        dist.print0(f'Warm start missing keys: {load_result.missing_keys}')
 
 #----------------------------------------------------------------------------
 # Uncertainty-based loss function (Equations 14,15,16,21) proposed in the
@@ -82,11 +245,14 @@ def training_loop(
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
-    device              = torch.device('cuda'),
+    pretrained_pkl      = './pretrained_model/edm2-img512-xs-2147483-0.135.pkl',
+    device              = None,
 ):
     # Initialize.
     prev_status_time = time.time()
-    misc.set_random_seed(seed, dist.get_rank())
+    misc.set_random_seed(seed)
+    if device is None:
+        device = dist.get_device()
     torch.backends.cudnn.benchmark = cudnn_benchmark
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -104,6 +270,11 @@ def training_loop(
     assert snapshot_nimg is None or (snapshot_nimg % batch_size == 0 and snapshot_nimg % 1024 == 0)
     assert checkpoint_nimg is None or (checkpoint_nimg % batch_size == 0 and checkpoint_nimg % 1024 == 0)
 
+    use_cpu_gloo_grad_sync = _should_use_cpu_gloo_grad_sync(device)
+    cpu_sync_group = torch.distributed.new_group(backend='gloo') if use_cpu_gloo_grad_sync else None
+    if use_cpu_gloo_grad_sync:
+        training_stats.init_multiprocessing(rank=dist.get_rank(), sync_device=torch.device('cpu'), sync_group=cpu_sync_group)
+
     # Setup dataset, encoder, and network.
     dist.print0('Loading dataset...')
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
@@ -120,16 +291,26 @@ def training_loop(
 
     # Print network summary.
     if dist.get_rank() == 0:
+        net.eval()
         misc.print_module_summary(net, [
             torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device),
             torch.ones([batch_gpu], device=device),
             torch.zeros([batch_gpu, net.label_dim,ref_seg.shape[-1],ref_seg.shape[-1]], device=device),
         ], max_nesting=2)
+        net.train()
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    dist.barrier()
 
     # Setup training state.
     dist.print0('Setting up training state...')
     state = dnnlib.EasyDict(cur_nimg=0, total_elapsed_time=0)
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
+    ddp_kwargs = {}
+    if device.type == 'cuda':
+        ddp_kwargs.update(device_ids=[device.index], output_device=device.index)
+    if dist.get_world_size() > 1:
+        ddp_kwargs.update(init_sync=False)
+    ddp = torch.nn.parallel.DistributedDataParallel(net, **ddp_kwargs)
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs)
     ema = dnnlib.util.construct_class_by_name(net=net, **ema_kwargs) if ema_kwargs is not None else None
@@ -138,19 +319,7 @@ def training_loop(
     checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
     pretrained_lag = checkpoint.load_latest(run_dir)
     if pretrained_lag is None:
-        with open('./pretrained_model/edm2-img512-xs-2147483-0.135.pkl', 'rb') as f:
-            state_dict = pickle.load(f)['ema'].cpu().state_dict()
-            del state_dict['unet.emb_label.weight']
-            del state_dict['unet.enc.64x64_conv.weight']
-            del state_dict['unet.out_conv.weight']
-
-        # 批量转换 emb_linear.weight 形状
-        for key in state_dict.keys():
-            if key.endswith('emb_linear.weight'):
-                state_dict[key] = state_dict[key][:, :, None, None]
-
-        net.load_state_dict(state_dict,strict=False)
-        print('load the pretrained model')
+        _load_image_warmstart(net=net, ema=ema, pretrained_pkl=pretrained_pkl)
 
     stop_at_nimg = total_nimg
     if slice_nimg is not None:
@@ -162,6 +331,7 @@ def training_loop(
     dist.print0()
 
     # Main training loop.
+    misc.set_random_seed(seed, dist.get_rank())
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed, start_idx=state.cur_nimg)
     dataset_iterator = iter(dnnlib.util.construct_class_by_name(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     prev_status_nimg = state.cur_nimg
@@ -227,7 +397,10 @@ def training_loop(
         # Save state checkpoint.
         if checkpoint_nimg is not None and (done or state.cur_nimg % checkpoint_nimg == 0) and state.cur_nimg != start_nimg:
             checkpoint.save(os.path.join(run_dir, f'training-state-{state.cur_nimg//1000:07d}.pt'))
-            misc.check_ddp_consistency(net)
+            if use_cpu_gloo_grad_sync:
+                _check_module_consistency_via_cpu(net, cpu_sync_group)
+            else:
+                misc.check_ddp_consistency(net)
 
         # Done?
         if done:
@@ -238,7 +411,8 @@ def training_loop(
         misc.set_random_seed(seed, dist.get_rank(), state.cur_nimg)
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
-            with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
+            sync_context = ddp.no_sync() if use_cpu_gloo_grad_sync else misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1))
+            with sync_context:
                 batch_sample= next(dataset_iterator)
                 images, masks, segs = batch_sample['img_latent'],batch_sample['mask_latent'],batch_sample['seg']   
                 images = encoder_img.encode_latents(images.to(device))
@@ -249,6 +423,8 @@ def training_loop(
 
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+        if use_cpu_gloo_grad_sync:
+            _sync_module_grads_via_cpu(net, cpu_sync_group)
 
         # Run optimizer and update weights.
         lr = dnnlib.util.call_func_by_name(cur_nimg=state.cur_nimg, batch_size=batch_size, **lr_kwargs)

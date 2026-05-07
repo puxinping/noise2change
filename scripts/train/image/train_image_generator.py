@@ -1,4 +1,5 @@
 import os
+os.environ["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = "0"
 import json
 import click
 import torch
@@ -55,6 +56,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     # Hyperparameters.
     c.update(total_nimg=opts.duration, batch_size=opts.batch)
     c.network_kwargs = dnnlib.EasyDict(class_name='training.networks_image.Precond', model_channels=opts.channels, dropout=opts.dropout)
+    c.network_kwargs.attn_resolutions = [32, 16]
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.training_loop_image.EDM2Loss', P_mean=opts.P_mean, P_std=opts.P_std)
     c.lr_kwargs = dnnlib.EasyDict(func_name='training.training_loop_image.learning_rate_schedule', ref_lr=opts.lr, ref_batches=opts.decay)
 
@@ -68,6 +70,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     c.status_nimg = opts.get('status', 0) or None
     c.snapshot_nimg = opts.get('snapshot', 0) or None
     c.checkpoint_nimg = opts.get('checkpoint', 0) or None
+    c.pretrained_pkl = opts.get('pretrained', './pretrained_model/edm2-img512-xs-2147483-0.135.pkl')
     c.seed = opts.get('seed', 0)
     return c
 
@@ -81,6 +84,7 @@ def print_training_config(run_dir, c):
     dist.print0()
     dist.print0(f'Output directory:        {run_dir}')
     dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
+    dist.print0(f'Warm-start checkpoint:   {c.pretrained_pkl}')
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
@@ -97,7 +101,7 @@ def launch_training(run_dir, c):
         with open(os.path.join(run_dir, 'training_options.json'), 'wt') as f:
             json.dump(c, f, indent=2)
 
-    torch.distributed.barrier()
+    dist.barrier()
     dnnlib.util.Logger(file_name=os.path.join(run_dir, 'log.txt'), file_mode='a', should_flush=True)
     training.training_loop_image.training_loop(run_dir=run_dir, **c)
 
@@ -126,6 +130,7 @@ def parse_nimg(s):
 # Main options.
 @click.option('--outdir',           help='Where to save the results', metavar='DIR',            type=str, required=True)
 @click.option('--data',             help='Path to the dataset', metavar='ZIP|DIR',              type=str, required=True)
+@click.option('--pretrained',       help='Official EDM2 checkpoint used for warm start', metavar='PKL', type=str, default='./pretrained_model/edm2-img512-xs-2147483-0.135.pkl', show_default=True)
 @click.option('--cond',             help='Train class-conditional model', metavar='BOOL',       type=bool, default=True, show_default=True)
 @click.option('--preset',           help='Configuration preset', metavar='STR',                 type=str, default='edm2-img512-s', show_default=True)
 
@@ -171,13 +176,26 @@ def cmdline(outdir, dry_run, **opts):
     """
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
-    dist.print0('Setting up training config...')
-    c = setup_training_config(**opts)
-    print_training_config(run_dir=outdir, c=c)
-    if dry_run:
-        dist.print0('Dry run; exiting.')
-    else:
-        launch_training(run_dir=outdir, c=c)
+    try:
+        dist.print0('Setting up training config...')
+        c = setup_training_config(**opts)
+        if c.batch_size % dist.get_world_size() != 0:
+            raise click.ClickException(f'--batch must be divisible by world size ({dist.get_world_size()})')
+        if c.total_nimg % c.batch_size != 0:
+            raise click.ClickException(f'--duration must be divisible by --batch ({c.batch_size})')
+        if c.status_nimg is not None and c.status_nimg % c.batch_size != 0:
+            raise click.ClickException(f'--status must be divisible by --batch ({c.batch_size})')
+        if c.snapshot_nimg is not None and (c.snapshot_nimg % c.batch_size != 0 or c.snapshot_nimg % 1024 != 0):
+            raise click.ClickException(f'--snapshot must be divisible by both --batch ({c.batch_size}) and 1024')
+        if c.checkpoint_nimg is not None and (c.checkpoint_nimg % c.batch_size != 0 or c.checkpoint_nimg % 1024 != 0):
+            raise click.ClickException(f'--checkpoint must be divisible by both --batch ({c.batch_size}) and 1024')
+        print_training_config(run_dir=outdir, c=c)
+        if dry_run:
+            dist.print0('Dry run; exiting.')
+        else:
+            launch_training(run_dir=outdir, c=c)
+    finally:
+        dist.destroy()
 
 #----------------------------------------------------------------------------
 
